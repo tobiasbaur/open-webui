@@ -278,11 +278,17 @@ async def chat_completion_tools_handler(
                     ):
                         skip_files = True
 
+                log.info(f"Received tool call: {tool_call}")
+                log.info(f"Executing tool: {tool_function_name} with params: {tool_function_params}")
+                log.info(f"Tool result: {tool_result}")
+
             # check if "tool_calls" in result
-            if result.get("tool_calls"):
-                for tool_call in result.get("tool_calls"):
+            tool_calls = result.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+                for tool_call in tool_calls:
                     await tool_call_handler(tool_call)
-            else:
+            elif "name" in result and "parameters" in result:
+                # Only process as a tool call if it looks like a tool call object
                 await tool_call_handler(result)
 
         except Exception as e:
@@ -324,7 +330,18 @@ async def chat_memory_handler(
             for doc_idx, doc in enumerate(results.documents[0]):
                 created_at_date = "Unknown Date"
 
-                if results.metadatas[0][doc_idx].get("created_at"):
+                # Guard for linter: ensure metadatas and index exist
+                if (
+                    hasattr(results, "metadatas")
+                    and results.metadatas
+                    and isinstance(results.metadatas, list)
+                    and len(results.metadatas) > 0
+                    and isinstance(results.metadatas[0], list)
+                    and doc_idx < len(results.metadatas[0])
+                    and results.metadatas[0][doc_idx]
+                    and isinstance(results.metadatas[0][doc_idx], dict)
+                    and results.metadatas[0][doc_idx].get("created_at")
+                ):
                     created_at_timestamp = results.metadatas[0][doc_idx]["created_at"]
                     created_at_date = time.strftime(
                         "%Y-%m-%d", time.localtime(created_at_timestamp)
@@ -370,28 +387,48 @@ async def chat_web_search_handler(
             user,
         )
 
-        response = res["choices"][0]["message"]["content"]
+        # Guard for linter: ensure res and keys exist
+        response = None
+        if (
+            res
+            and isinstance(res, dict)
+            and "choices" in res
+            and isinstance(res["choices"], list)
+            and len(res["choices"]) > 0
+            and "message" in res["choices"][0]
+            and isinstance(res["choices"][0]["message"], dict)
+            and "content" in res["choices"][0]["message"]
+        ):
+            response = res["choices"][0]["message"]["content"]
+        else:
+            response = ""
 
-        try:
-            bracket_start = response.find("{")
-            bracket_end = response.rfind("}") + 1
+        if isinstance(response, str):
+            try:
+                bracket_start = response.find("{")
+                bracket_end = response.rfind("}") + 1
 
-            if bracket_start == -1 or bracket_end == -1:
-                raise Exception("No JSON object found in the response")
+                if bracket_start == -1 or bracket_end == -1:
+                    raise Exception("No JSON object found in the response")
 
-            response = response[bracket_start:bracket_end]
-            queries = json.loads(response)
-            queries = queries.get("queries", [])
-        except Exception as e:
-            queries = [response]
+                response = response[bracket_start:bracket_end]
+                queries = json.loads(response)
+                queries = queries.get("queries", [])
+            except Exception as e:
+                queries = [response]
+        else:
+            queries = [user_message]
 
     except Exception as e:
         log.exception(e)
         queries = [user_message]
 
     # Check if generated queries are empty
-    if len(queries) == 1 and queries[0].strip() == "":
+    if len(queries) == 1 and queries[0] and isinstance(queries[0], str) and queries[0].strip() == "":
         queries = [user_message]
+
+    # Ensure queries is a list of strings (no None)
+    queries = [q for q in queries if isinstance(q, str) and q is not None]
 
     # Check if queries are not found
     if len(queries) == 0:
@@ -427,6 +464,8 @@ async def chat_web_search_handler(
 
         if results:
             files = form_data.get("files", [])
+            if files is None:
+                files = []
 
             if results.get("collection_names"):
                 for col_idx, collection_name in enumerate(
@@ -435,7 +474,7 @@ async def chat_web_search_handler(
                     files.append(
                         {
                             "collection_name": collection_name,
-                            "name": ", ".join(queries),
+                            "name": ", ".join([q for q in queries if isinstance(q, str)]),
                             "type": "web_search",
                             "urls": results["filenames"],
                             "queries": queries,
@@ -447,7 +486,7 @@ async def chat_web_search_handler(
                 files.append(
                     {
                         "docs": docs,
-                        "name": ", ".join(queries),
+                        "name": ", ".join([q for q in queries if isinstance(q, str)]),
                         "type": "web_search",
                         "urls": results["filenames"],
                         "queries": queries,
@@ -716,6 +755,9 @@ def apply_params_to_form_data(form_data, model):
 
 
 async def process_chat_payload(request, form_data, user, metadata, model):
+    log.info("Entered process_chat_payload")
+    log.info(f"Incoming form_data: {form_data}")
+    log.info(f"Incoming metadata: {metadata}")
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
@@ -898,23 +940,25 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     "server": tool_server,
                 }
 
+    # Restore correct conditional logic for tool calling
+    should_call_tool_handler = False
     if tools_dict:
-        if metadata.get("function_calling") == "native":
-            # If the function calling is native, then call the tools function calling handler
-            metadata["tools"] = tools_dict
-            form_data["tools"] = [
-                {"type": "function", "function": tool.get("spec", {})}
-                for tool in tools_dict.values()
-            ]
-        else:
-            # If the function calling is not native, then call the tools function calling handler
-            try:
-                form_data, flags = await chat_completion_tools_handler(
-                    request, form_data, extra_params, user, models, tools_dict
-                )
-                sources.extend(flags.get("sources", []))
-            except Exception as e:
-                log.exception(e)
+        # Call tool handler if function_calling is 'native' or if tool_ids/tool_servers are present
+        if (
+            metadata.get('function_calling') == 'native'
+            or tool_ids
+            or metadata.get('tool_servers')
+        ):
+            should_call_tool_handler = True
+
+    if should_call_tool_handler:
+        try:
+            form_data, flags = await chat_completion_tools_handler(
+                request, form_data, extra_params, user, models, tools_dict
+            )
+            sources.extend(flags.get("sources", []))
+        except Exception as e:
+            log.exception(e)
 
     try:
         form_data, flags = await chat_completion_files_handler(request, form_data, user)
@@ -1003,12 +1047,33 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             }
         )
 
+    # For debugging: always call chat_completion_tools_handler if tools_dict is not empty
+    if tools_dict:
+        try:
+            form_data, flags = await chat_completion_tools_handler(
+                request, form_data, extra_params, user, models, tools_dict
+            )
+            sources.extend(flags.get("sources", []))
+        except Exception as e:
+            log.exception(e)
+
+    # After building tool_ids and tools_dict in process_chat_payload
+    log.info(f"tool_ids: {tool_ids}")
+    log.info(f"tools_dict: {tools_dict}")
+    if tool_ids and not tools_dict:
+        log.warning("tool_ids present but tools_dict is empty. Tool may not be registered or loaded correctly.")
+    if not tool_ids:
+        log.warning("No tool_ids present. Tool calling will not be triggered.")
+
+    log.info(f"Final payload to vLLM: {form_data}")
+
     return form_data, metadata, events
 
 
 async def process_chat_response(
     request, response, form_data, user, metadata, model, events, tasks
 ):
+    log.info("Entered process_chat_response")
     async def background_tasks_handler():
         message_map = Chats.get_messages_by_chat_id(metadata["chat_id"])
         message = message_map.get(metadata["message_id"]) if message_map else None
@@ -2071,51 +2136,36 @@ async def process_chat_response(
                         tool_name = tool_call.get("function", {}).get("name", "")
                         tool_args = tool_call.get("function", {}).get("arguments", "{}")
 
-                        tool_function_params = {}
+                        # vLLM expects tool call arguments as valid JSON strings
                         try:
-                            # json.loads cannot be used because some models do not produce valid JSON
-                            tool_function_params = ast.literal_eval(tool_args)
+                            tool_function_params = json.loads(tool_args)
                         except Exception as e:
                             log.debug(e)
-                            # Fallback to JSON parsing
+                            # Fallback to ast.literal_eval if JSON fails
                             try:
-                                tool_function_params = json.loads(tool_args)
+                                tool_function_params = ast.literal_eval(tool_args)
                             except Exception as e:
-                                log.error(
-                                    f"Error parsing tool call arguments: {tool_args}"
-                                )
+                                log.error(f"Error parsing tool call arguments: {tool_args}")
+                                tool_function_params = {}
 
-                        # Mutate the original tool call response params as they are passed back to the passed
-                        # back to the LLM via the content blocks. If they are in a json block and are invalid json,
-                        # this can cause downstream LLM integrations to fail (e.g. bedrock gateway) where response
-                        # params are not valid json.
-                        # Main case so far is no args = "" = invalid json.
-                        log.debug(
-                            f"Parsed args from {tool_args} to {tool_function_params}"
-                        )
-                        tool_call.setdefault("function", {})["arguments"] = json.dumps(
-                            tool_function_params
-                        )
+                        # Ensure tool_call arguments are always JSON strings for vLLM
+                        tool_call.setdefault("function", {})["arguments"] = json.dumps(tool_function_params)
 
-                        tool_result = None
-
+                        # vLLM expects the tool result to be sent as a message with role 'tool' and correct tool_call_id
                         if tool_name in tools:
                             tool = tools[tool_name]
                             spec = tool.get("spec", {})
-
                             try:
                                 allowed_params = (
                                     spec.get("parameters", {})
                                     .get("properties", {})
                                     .keys()
                                 )
-
                                 tool_function_params = {
                                     k: v
                                     for k, v in tool_function_params.items()
                                     if k in allowed_params
                                 }
-
                                 if tool.get("direct", False):
                                     tool_result = await event_caller(
                                         {
@@ -2125,19 +2175,15 @@ async def process_chat_response(
                                                 "name": tool_name,
                                                 "params": tool_function_params,
                                                 "server": tool.get("server", {}),
-                                                "session_id": metadata.get(
-                                                    "session_id", None
-                                                ),
+                                                "session_id": metadata.get("session_id", None),
                                             },
                                         }
                                     )
-
                                 else:
                                     tool_function = tool["callable"]
                                     tool_result = await tool_function(
                                         **tool_function_params
                                     )
-
                             except Exception as e:
                                 tool_result = str(e)
 
@@ -2166,6 +2212,26 @@ async def process_chat_response(
                             }
                         )
 
+                    # For vLLM, send a message with role 'tool' for each tool result
+                    if model.get("owned_by", "").lower() == "vllm":
+                        for result in results:
+                            await event_emitter(
+                                {
+                                    "type": "chat:completion",
+                                    "data": {
+                                        "choices": [
+                                            {
+                                                "message": {
+                                                    "role": "tool",
+                                                    "tool_call_id": result["tool_call_id"],
+                                                    "content": result["content"],
+                                                }
+                                            }
+                                        ]
+                                    },
+                                }
+                            )
+
                     content_blocks[-1]["results"] = results
 
                     content_blocks.append(
@@ -2185,13 +2251,23 @@ async def process_chat_response(
                     )
 
                     try:
+                        # When sending payload to vLLM, ensure 'tools' is a list of function specs
+                        # Also, include the tool message(s) in the message history
+                        tool_messages = [
+                            {
+                                "role": "tool",
+                                "tool_call_id": result["tool_call_id"],
+                                "content": result["content"],
+                            }
+                            for result in results
+                        ]
                         new_form_data = {
                             "model": model_id,
                             "stream": True,
-                            "tools": form_data["tools"],
                             "messages": [
                                 *form_data["messages"],
                                 *convert_content_blocks_to_messages(content_blocks),
+                                *tool_messages,
                             ],
                         }
 
