@@ -165,6 +165,7 @@ async def generate_chat_completion(
     bypass_filter: bool = False,
 ):
     log.debug(f"generate_chat_completion: {form_data}")
+    print(f"generate_chat_completion: {form_data}")
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
@@ -236,6 +237,9 @@ async def generate_chat_completion(
                 response = await generate_chat_completion(
                     request, form_data, user, bypass_filter=True
                 )
+
+                log.debug(f"[vllm] Response: {response}")
+                print("[vllm] Response:", response)
                 return StreamingResponse(
                     stream_wrapper(response.body_iterator),
                     media_type="text/event-stream",

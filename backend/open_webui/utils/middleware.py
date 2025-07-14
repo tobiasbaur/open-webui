@@ -100,9 +100,9 @@ from open_webui.env import (
 from open_webui.constants import TASKS
 
 
-logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
+logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
-log.setLevel(SRC_LOG_LEVELS["MAIN"])
+log.setLevel(logging.DEBUG)
 
 
 async def chat_completion_tools_handler(
@@ -179,26 +179,33 @@ async def chat_completion_tools_handler(
             return body, {}
 
         try:
-            content = content[content.find("{") : content.rfind("}") + 1]
-            if not content:
-                raise Exception("No JSON object found in the response")
+            # For vllm, the response may be a dict with 'tool_calls' as a list of dicts
+            # Try to parse as JSON, fallback to OpenAI-style
+            content_json = None
+            try:
+                content_json = json.loads(content)
+            except Exception:
+                content_json = None
 
-            result = json.loads(content)
+            # Normalize vllm tool call output if detected
+            if content_json and "tool_calls" in content_json and isinstance(content_json["tool_calls"], list):
+                result = content_json
+            else:
+                # Fallback: try to extract JSON object from string
+                content = content[content.find("{") : content.rfind("}") + 1]
+                if not content:
+                    raise Exception("No JSON object found in the response")
+                result = json.loads(content)
 
             async def tool_call_handler(tool_call):
                 nonlocal skip_files
-
                 log.debug(f"{tool_call=}")
-
                 tool_function_name = tool_call.get("name", None)
                 if tool_function_name not in tools:
                     return body, {}
-
                 tool_function_params = tool_call.get("parameters", {})
-
                 try:
                     tool = tools[tool_function_name]
-
                     spec = tool.get("spec", {})
                     allowed_params = (
                         spec.get("parameters", {}).get("properties", {}).keys()
@@ -208,7 +215,6 @@ async def chat_completion_tools_handler(
                         for k, v in tool_function_params.items()
                         if k in allowed_params
                     }
-
                     if tool.get("direct", False):
                         tool_result = await event_caller(
                             {
@@ -225,32 +231,24 @@ async def chat_completion_tools_handler(
                     else:
                         tool_function = tool["callable"]
                         tool_result = await tool_function(**tool_function_params)
-
                 except Exception as e:
                     tool_result = str(e)
-
                 tool_result_files = []
                 if isinstance(tool_result, list):
                     for item in tool_result:
-                        # check if string
                         if isinstance(item, str) and item.startswith("data:"):
                             tool_result_files.append(item)
                             tool_result.remove(item)
-
                 if isinstance(tool_result, dict) or isinstance(tool_result, list):
                     tool_result = json.dumps(tool_result, indent=2)
-
                 if isinstance(tool_result, str):
                     tool = tools[tool_function_name]
                     tool_id = tool.get("tool_id", "")
-
                     tool_name = (
                         f"{tool_id}/{tool_function_name}"
                         if tool_id
                         else f"{tool_function_name}"
                     )
-
-                    # Citation is enabled for this tool
                     sources.append(
                         {
                             "source": {
@@ -266,12 +264,10 @@ async def chat_completion_tools_handler(
                             "tool_result": True,
                         }
                     )
-                    # Citation is not enabled for this tool
                     body["messages"] = add_or_update_user_message(
                         f"\nTool `{tool_name}` Output: {tool_result}",
                         body["messages"],
                     )
-
                     if (
                         tools[tool_function_name]
                         .get("metadata", {})
@@ -280,11 +276,37 @@ async def chat_completion_tools_handler(
                         skip_files = True
 
             # check if "tool_calls" in result
-            if result.get("tool_calls"):
-                for tool_call in result.get("tool_calls"):
+            tool_calls = result.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+                for tool_call in tool_calls:
                     await tool_call_handler(tool_call)
             else:
-                await tool_call_handler(result)
+                # No tool calls: treat as normal answer, update messages and return
+                content = result.get("content") or result
+                body["messages"] = add_or_update_user_message(
+                    f"{content}",
+                    body["messages"],
+                )
+                # Emit chat:completion event if possible
+                event_emitter = extra_params.get("__event_emitter__")
+                if event_emitter:
+                    await event_emitter({
+                        "type": "chat:completion",
+                        "data": {
+                            "done": True,
+                            "content": content,
+                        }
+                    })
+                # Return OpenAI-style response for HTTP
+                return {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                        }
+                    }],
+                    "done": True,
+                }, {}
 
         except Exception as e:
             log.debug(f"Error: {e}")
@@ -730,6 +752,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
 
+    print("DEBUG: process_chat_payload called, backend_type:", model.get("owned_by"))
+    print("DEBUG: model dict:", model)
+
     form_data = apply_params_to_form_data(form_data, model)
     log.debug(f"form_data: {form_data}")
 
@@ -929,19 +954,68 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 }
 
     if tools_dict:
+        # Detect backend type
+        backend_type = None
+        if model.get("owned_by") == "ollama":
+            backend_type = "ollama"
+        elif model.get("owned_by") == "vllm" or model.get("openai", {}).get("owned_by") == "vllm":
+            backend_type = "vllm"
+        elif model.get("owned_by") == "openai":
+            backend_type = "openai"
+        else:
+            backend_type = None
+
         if metadata.get("function_calling") == "native":
-            # If the function calling is native, then call the tools function calling handler
-            metadata["tools"] = tools_dict
-            form_data["tools"] = [
-                {"type": "function", "function": tool.get("spec", {})}
-                for tool in tools_dict.values()
-            ]
+            # For vllm, do NOT add tools to metadata, only to payload
+            if backend_type == "vllm":
+                form_data["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {k: v for k, v in tool.get("spec", {}).items() if k != "type"}
+                    }
+                    for tool in tools_dict.values()
+                ]
+                form_data["tool_choice"] = "auto"
+                # Force stream to False for vllm to avoid UI hanging
+                form_data["stream"] = False
+                # Remove any tools from metadata if present
+                if "tools" in metadata:
+                    del metadata["tools"]
+                # --- Sanitize payload for vllm ---
+                def sanitize_vllm_payload(payload):
+                    allowed_fields = {
+                        "model",
+                        "messages",
+                        "tools",
+                        "tool_choice",
+                        "stream",
+                        "max_tokens",
+                        "temperature",
+                        "top_p",
+                        "stop",
+                        "user",
+                    }
+                    return {k: v for k, v in payload.items() if k in allowed_fields}
+                form_data = sanitize_vllm_payload(form_data)
+                log.debug(f"[vllm] Outgoing payload: {json.dumps(form_data, indent=2, ensure_ascii=False)}")
+                print("[vllm] Outgoing payload:", json.dumps(form_data, indent=2, ensure_ascii=False))
+            else:
+                # For other backends, add tools to both metadata and payload
+                metadata["tools"] = tools_dict
+                form_data["tools"] = [
+                    {"type": "function", "function": tool.get("spec", {})}
+                    for tool in tools_dict.values()
+                ]
         else:
             # If the function calling is not native, then call the tools function calling handler
             try:
-                form_data, flags = await chat_completion_tools_handler(
+                tool_result, flags = await chat_completion_tools_handler(
                     request, form_data, extra_params, user, models, tools_dict
                 )
+                # If tool_result is an OpenAI-style response (has 'choices'), return it immediately
+                if isinstance(tool_result, dict) and "choices" in tool_result:
+                    return tool_result, metadata, []
+                form_data = tool_result
                 sources.extend(flags.get("sources", []))
             except Exception as e:
                 log.exception(e)

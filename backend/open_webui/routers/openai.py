@@ -116,6 +116,76 @@ def openai_o_series_handler(payload):
     return payload
 
 
+def parse_streaming_response(response_text: str) -> dict:
+    """
+    Parse a streaming response (Server-Sent Events) and extract the final response.
+    This reconstructs the complete response from the streaming chunks.
+    """
+    lines = response_text.strip().split('\n')
+    final_response = {
+        "id": "",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": ""
+            },
+            "finish_reason": None
+        }]
+    }
+    
+    content_parts = []
+    
+    for line in lines:
+        if line.startswith('data: '):
+            data_part = line[6:]  # Remove 'data: ' prefix
+            
+            if data_part == '[DONE]':
+                break
+                
+            try:
+                chunk = json.loads(data_part)
+                
+                # Extract basic info from first chunk
+                if not final_response["id"] and "id" in chunk:
+                    final_response["id"] = chunk["id"]
+                if not final_response["object"] and "object" in chunk:
+                    final_response["object"] = chunk["object"]
+                if not final_response["created"] and "created" in chunk:
+                    final_response["created"] = chunk["created"]
+                if not final_response["model"] and "model" in chunk:
+                    final_response["model"] = chunk["model"]
+                
+                # Extract content from choices
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    choice = chunk["choices"][0]
+                    if "delta" in choice:
+                        delta = choice["delta"]
+                        if "content" in delta:
+                            content_parts.append(delta["content"])
+                        
+                        # Check for tool calls in delta
+                        if "tool_calls" in delta:
+                            if "tool_calls" not in final_response["choices"][0]["message"]:
+                                final_response["choices"][0]["message"]["tool_calls"] = []
+                            final_response["choices"][0]["message"]["tool_calls"].extend(delta["tool_calls"])
+                    
+                    # Check for finish reason
+                    if "finish_reason" in choice and choice["finish_reason"]:
+                        final_response["choices"][0]["finish_reason"] = choice["finish_reason"]
+                        
+            except json.JSONDecodeError:
+                continue
+    
+    # Combine all content parts
+    final_response["choices"][0]["message"]["content"] = "".join(content_parts)
+    
+    return final_response
+
+
 ##########################################
 #
 # API routes
@@ -709,6 +779,7 @@ async def generate_chat_completion(
     user=Depends(get_verified_user),
     bypass_filter: Optional[bool] = False,
 ):
+    log.debug(f"generate_chat_completion: {form_data}")
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
@@ -838,6 +909,58 @@ async def generate_chat_completion(
         request_url = f"{url}/chat/completions"
         headers["Authorization"] = f"Bearer {key}"
 
+    # Process tools if present
+    tool_ids = form_data.get("tool_ids", None)
+    frontend_requested_stream = form_data.get("stream", False)
+    if tool_ids:
+        from open_webui.utils.tools import get_tools
+        from open_webui.utils.middleware import get_event_emitter, get_event_call
+        
+        # Get tools
+        tools_dict = get_tools(
+            request,
+            tool_ids,
+            user,
+            {
+                "__user__": user.model_dump() if hasattr(user, 'model_dump') else {},
+                "__model__": model,
+                "__messages__": payload.get("messages", []),
+                "__files__": form_data.get("files", []),
+            },
+        )
+        
+        if tools_dict:
+            # Add tools to payload for vLLM
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {k: v for k, v in tool.get("spec", {}).items() if k != "type"}
+                }
+                for tool in tools_dict.values()
+            ]
+            payload["tool_choice"] = "auto"
+            # Hybrid fix: always set stream=False for vLLM tool calls (so tool calls work),
+            # but remember if frontend wanted streaming
+            payload["stream"] = False
+            
+            # Sanitize payload for vllm
+            def sanitize_vllm_payload(payload):
+                allowed_fields = {
+                    "model",
+                    "messages", 
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "max_tokens",
+                    "temperature",
+                    "top_p",
+                    "stop",
+                    "user",
+                }
+                return {k: v for k, v in payload.items() if k in allowed_fields}
+            payload = sanitize_vllm_payload(payload)
+            print("[vllm] Outgoing payload with tools:", json.dumps(payload, indent=2, ensure_ascii=False))
+
     payload = json.dumps(payload)
 
     r = None
@@ -857,24 +980,26 @@ async def generate_chat_completion(
             headers=headers,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
         )
-
-        # Check if response is SSE
+        
+        # Always parse the response for tool call detection
+        response_text = await r.text()
+        print("Response text:", response_text)
+        
+        # Check if response is streaming
         if "text/event-stream" in r.headers.get("Content-Type", ""):
-            streaming = True
-            return StreamingResponse(
-                r.content,
-                status_code=r.status,
-                headers=dict(r.headers),
-                background=BackgroundTask(
-                    cleanup_response, response=r, session=session
-                ),
-            )
+            # Parse the streaming response to extract the final response
+            final_response = parse_streaming_response(response_text)
+            print("Parsed final response:", final_response)
+            
+            r.raise_for_status()
+            return final_response
         else:
+            # Handle non-streaming response
             try:
                 response = await r.json()
             except Exception as e:
                 log.error(e)
-                response = await r.text()
+                response = response_text
 
             r.raise_for_status()
             return response

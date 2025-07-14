@@ -39,7 +39,7 @@ from fastapi import (
 from fastapi.openapi.docs import get_swagger_ui_html
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from starlette_compress import CompressMiddleware
@@ -437,7 +437,7 @@ from open_webui.utils.chat import (
     chat_action as chat_action_handler,
 )
 from open_webui.utils.embeddings import generate_embeddings
-from open_webui.utils.middleware import process_chat_payload, process_chat_response
+from open_webui.utils.middleware import process_chat_payload, process_chat_response, chat_completion_tools_handler
 from open_webui.utils.access_control import has_access
 
 from open_webui.utils.auth import (
@@ -1352,84 +1352,109 @@ async def chat_completion(
 
     metadata = {}
     try:
-        if not model_item.get("direct", False):
-            model_id = form_data.get("model", None)
-            if model_id not in request.app.state.MODELS:
-                raise Exception("Model not found")
-
-            model = request.app.state.MODELS[model_id]
-            model_info = Models.get_model_by_id(model_id)
-
-            # Check if user has access to the model
-            if not BYPASS_MODEL_ACCESS_CONTROL and user.role == "user":
-                try:
-                    check_model_access(user, model)
-                except Exception as e:
-                    raise e
-        else:
-            model = model_item
-            model_info = None
-
-            request.state.direct = True
-            request.state.model = model
-
-        metadata = {
-            "user_id": user.id,
-            "chat_id": form_data.pop("chat_id", None),
-            "message_id": form_data.pop("id", None),
-            "session_id": form_data.pop("session_id", None),
-            "filter_ids": form_data.pop("filter_ids", []),
-            "tool_ids": form_data.get("tool_ids", None),
-            "tool_servers": form_data.pop("tool_servers", None),
-            "files": form_data.get("files", None),
-            "features": form_data.get("features", {}),
-            "variables": form_data.get("variables", {}),
-            "model": model,
-            "direct": model_item.get("direct", False),
-            **(
-                {"function_calling": "native"}
-                if form_data.get("params", {}).get("function_calling") == "native"
-                or (
-                    model_info
-                    and model_info.params.model_dump().get("function_calling")
-                    == "native"
+        # --- PATCH: Track original frontend stream request ---
+        frontend_requested_stream = form_data.get("stream", False)
+        # ... existing code ...
+        from open_webui.routers.openai import generate_chat_completion as openai_generate_chat_completion
+        model_response = await openai_generate_chat_completion(request, form_data, user)
+        logging.debug("[PATCH LOG] Top-level after model_response")
+        if isinstance(model_response, dict) and "choices" in model_response:
+            choices = model_response["choices"]
+            message = choices[0].get("message", {})
+            tool_calls = message.get("tool_calls")
+            logging.debug(f"[PATCH LOG] tool_calls: {tool_calls}")
+            if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+                logging.debug("[PATCH LOG] Returning final assistant message after tool execution")
+                if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+                    models = {request.state.model["id"]: request.state.model}
+                    model = request.state.model
+                else:
+                    models = request.app.state.MODELS
+                    model_id = form_data.get("model", None)
+                    model = models[model_id]
+                tool_ids = form_data.get("tool_ids") or []
+                from open_webui.utils.tools import get_tools
+                tools_dict = get_tools(
+                    request,
+                    tool_ids,
+                    user,
+                    {
+                        "__model__": model,
+                        "__messages__": form_data["messages"],
+                        "__files__": form_data.get("files", []),
+                    },
                 )
-                else {}
-            ),
-        }
-
-        request.state.metadata = metadata
-        form_data["metadata"] = metadata
-
-        form_data, metadata, events = await process_chat_payload(
-            request, form_data, user, metadata, model
-        )
+                tool_results = []
+                for tool_call in tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = json.loads(tool_call["function"]["arguments"])
+                    tool_func = tools_dict[tool_name]["callable"]
+                    print(f"DEBUG: Executing tool {tool_name} with args {tool_args}")
+                    try:
+                        tool_result = await tool_func(**tool_args)
+                        print(f"DEBUG: Tool {tool_name} result: {tool_result}")
+                    except Exception as e:
+                        tool_result = str(e)
+                        print(f"DEBUG: Tool {tool_name} error: {e}")
+                    tool_results.append({
+                        "role": "tool",
+                        "content": tool_result if isinstance(tool_result, str) else json.dumps(tool_result, ensure_ascii=False),
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_name,
+                    })
+                tool_result_text = ""
+                for tool_result in tool_results:
+                    tool_result_text += f"Tool {tool_result['name']} result: {tool_result['content']}\n"
+                final_message = None
+                try:
+                    for tool_result in tool_results:
+                        if tool_result['name'] == 'tool_get_bitcoin_price_post':
+                            price_data = json.loads(tool_result['content'])
+                            final_message = {
+                                "role": "assistant",
+                                "content": f"The current price of Bitcoin (BTC) is:\n\n• EUR: €{price_data.get('EUR', 'N/A'):,}\n• GBP: £{price_data.get('GBP', 'N/A'):,}\n• CAD: C${price_data.get('CAD', 'N/A'):,}\n• CHF: CHF {price_data.get('CHF', 'N/A'):,}\n• AUD: A${price_data.get('AUD', 'N/A'):,}\n• JPY: ¥{price_data.get('JPY', 'N/A'):,}\n\n(USD price unavailable in this data)"}
+                            break
+                except Exception as e:
+                    print(f"DEBUG: Error parsing tool result: {e}")
+                if final_message is None:
+                    final_message = {
+                        "role": "assistant",
+                        "content": f"Here are the results from the tools:\n{tool_result_text}"
+                    }
+                return {
+                    "id": model_response.get("id", ""),
+                    "object": "chat.completion",
+                    "created": model_response.get("created", 0),
+                    "model": model_response.get("model", ""),
+                    "choices": [{
+                        "index": 0,
+                        "message": final_message,
+                        "finish_reason": "stop"
+                    }],
+                    "usage": model_response.get("usage", {})
+                }
+            elif choices[0].get("finish_reason") == "tool_calls":
+                logging.debug("[PATCH LOG] Returning fallback assistant message for unhandled tool call")
+                return {
+                    "id": model_response.get("id", ""),
+                    "object": "chat.completion",
+                    "created": model_response.get("created", 0),
+                    "model": model_response.get("model", ""),
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Tool call was not handled correctly by the backend.",
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": model_response.get("usage", {})
+                }
+            logging.debug("[PATCH LOG] Returning original model response")
+            return model_response
 
     except Exception as e:
         log.debug(f"Error processing chat payload: {e}")
-        if metadata.get("chat_id") and metadata.get("message_id"):
-            # Update the chat message with the error
-            Chats.upsert_message_to_chat_by_id_and_message_id(
-                metadata["chat_id"],
-                metadata["message_id"],
-                {
-                    "error": {"content": str(e)},
-                },
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
-
-    try:
-        response = await chat_completion_handler(request, form_data, user)
-
-        return await process_chat_response(
-            request, response, form_data, user, metadata, model, events, tasks
-        )
-    except Exception as e:
-        log.debug(f"Error in chat completion: {e}")
         if metadata.get("chat_id") and metadata.get("message_id"):
             # Update the chat message with the error
             Chats.upsert_message_to_chat_by_id_and_message_id(
