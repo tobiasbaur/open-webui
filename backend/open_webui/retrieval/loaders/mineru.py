@@ -93,6 +93,9 @@ class MinerULoader:
 
         # Backend/model version (Local API uses "backend" parameter)
         if self.model_version == "vlm":
+            form_data["backend"] = "vlm-vllm-async-engine"
+        # Legacy
+        elif self.model_version == "vlm-sync":
             form_data["backend"] = "vlm-vllm-engine"
         else:
             form_data["backend"] = "pipeline"
